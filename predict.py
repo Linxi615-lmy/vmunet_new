@@ -1,0 +1,397 @@
+import os
+import cv2
+import torch
+import numpy as np
+from networks.vmunet import VMUNet
+from torch import nn
+from tqdm import tqdm
+from torchvision import transforms
+import argparse
+from networks.vit_seg_modeling import VisionTransformer as ViT_seg 
+from networks.vit_seg_modeling import CONFIGS as CONFIGS_ViT_seg
+import scipy
+from scipy.spatial.distance import directed_hausdorff, cdist 
+import os
+from datetime import datetime
+
+
+
+def calmdsc(imgdir1, imgdir2):  # mdice
+    miou = 0
+    for img in os.listdir(imgdir1):
+        imgpath1 = os.path.join(imgdir1, img)
+        imgpath2 = os.path.join(imgdir2, img)
+        img1 = cv2.imread(imgpath1, 0)
+        img2 = cv2.imread(imgpath2, 0)
+        img1 = cv2.resize(img1, (256, 256))
+        img2 = cv2.resize(img2, (256, 256))
+        img1[img1 <= 125] = 0
+        img1[img1 > 125] = 1
+        img2[img2 <= 125] = 0
+        img2[img2 > 125] = 1
+        img1 = img1.astype(np.uint8)
+        img2 = img2.astype(np.uint8)
+        img3 = cv2.bitwise_and(img1, img2)
+        img4 = cv2.bitwise_or(img1, img2)
+        iou = 2 * img3.ravel().sum() / (img4.ravel().sum() + img3.ravel().sum()) if (img4.ravel().sum() + img3.ravel().sum()) != 0 else 0
+        miou = miou + iou
+    return miou / len(os.listdir(imgdir1))
+
+
+def calmiou(imgdir1, imgdir2):  # miou
+    miou = 0
+    mdsc = 0
+    for img in os.listdir(imgdir1):
+        imgpath1 = os.path.join(imgdir1, img)
+        imgpath2 = os.path.join(imgdir2, img)
+        img1 = cv2.imread(imgpath1, 0)
+        img2 = cv2.imread(imgpath2, 0)
+        if img2 is None:  # 检查是否成功读取文件
+            print(f"无法读取文件: {imgpath2}，跳过该文件的处理。")
+            continue  # 跳过本次循环，继续处理下一个文件
+        img1 = cv2.resize(img1, (256, 256))
+        img2 = cv2.resize(img2, (256, 256))
+        img1[img1 <= 125] = 0
+        img1[img1 > 125] = 1
+        img2[img2 <= 125] = 0
+        img2[img2 > 125] = 1
+        img1 = img1.astype(np.uint8)
+        img2 = img2.astype(np.uint8)
+        img3 = cv2.bitwise_and(img1, img2)
+        img4 = cv2.bitwise_or(img1, img2)
+        iou = img3.ravel().sum() / img4.ravel().sum() if img4.ravel().sum() != 0 else 0
+        miou = miou + iou
+
+        dsc = 2 * img3.ravel().sum() / (img4.ravel().sum() + img3.ravel().sum()) if (img4.ravel().sum() + img3.ravel().sum()) != 0 else 0
+        mdsc = mdsc + dsc
+
+    return miou / len(os.listdir(imgdir1)), mdsc / len(os.listdir(imgdir1))
+
+def calall(imgdir1, imgdir2):
+    # 初始化各项指标
+    miou = mdsc = accuracy = specificity = sensitivity = 0
+    total_imgs = len(os.listdir(imgdir1))  # 计算图像总数
+
+    for img in os.listdir(imgdir1):
+        imgpath1 = os.path.join(imgdir1, img)
+        
+        # 掩码固定以 _segmentation.png 结尾
+        base_name = os.path.splitext(img)[0]
+        imgpath2 = os.path.join(imgdir2, base_name + '_segmentation.png')
+
+        img1 = cv2.imread(imgpath1, 0)
+        img2 = cv2.imread(imgpath2, 0)
+            
+        img1 = cv2.resize(img1, (256, 256))
+        img2 = cv2.resize(img2, (256, 256))
+        img1[img1 <= 125] = 0
+        img1[img1 > 125] = 1
+        img2[img2 <= 125] = 0
+        img2[img2 > 125] = 1
+        img1 = img1.astype(np.uint8)
+        img2 = img2.astype(np.uint8)
+
+        # 计算交并比(IoU)和Dice相似系数(DSC)
+        img3 = cv2.bitwise_and(img1, img2)
+        img4 = cv2.bitwise_or(img1, img2)
+        iou = img3.ravel().sum() / img4.ravel().sum() if img4.ravel().sum() != 0 else 0
+        miou += iou
+        dsc = 2 * img3.ravel().sum() / (img4.ravel().sum() + img3.ravel().sum()) if (img4.ravel().sum() + img3.ravel().sum()) != 0 else 0
+        mdsc += dsc
+
+        # 计算TP, TN, FP, FN
+        tp = np.logical_and(img1 == 1, img2 == 1).sum()
+        tn = np.logical_and(img1 == 0, img2 == 0).sum()
+        fp = np.logical_and(img1 == 0, img2 == 1).sum()
+        fn = np.logical_and(img1 == 1, img2 == 0).sum()
+
+        # 计算准确性(Accuracy)，特异性(Specificity)，敏感性(Sensitivity)
+        accuracy += (tp + tn) / (tp + tn + fp + fn)
+        specificity += tn / (tn + fp) if (tn + fp) != 0 else 0
+        sensitivity += tp / (tp + fn) if (tp + fn) != 0 else 0
+
+    # 计算平均值并返回
+    return miou / total_imgs, mdsc / total_imgs, accuracy / total_imgs, specificity / total_imgs, sensitivity / total_imgs
+
+def calalll(imgdir1, imgdir2):
+    total_imgs = len(os.listdir(imgdir1))
+    if total_imgs == 0:
+        return 0, 0, 0, 0, 0, 0, 0  # 如果没有图像，返回0
+
+    miou = mdsc = accuracy = specificity = sensitivity = hausdorff_distance = assd = 0
+
+    for img in os.listdir(imgdir1):
+        imgpath1 = os.path.join(imgdir1, img)
+        imgpath2 = os.path.join(imgdir2, img)
+        img1 = cv2.imread(imgpath1, 0)
+        img2 = cv2.imread(imgpath2, 0)
+        img1 = cv2.resize(img1, (256, 256))
+        img2 = cv2.resize(img2, (256, 256))
+        img1[img1 <= 125] = 0
+        img1[img1 > 125] = 1
+        img2[img2 <= 125] = 0
+        img2[img2 > 125] = 1
+        img1 = img1.astype(np.bool_)
+        img2 = img2.astype(np.bool_)
+
+        # 计算交并比(IoU)和Dice相似系数(DSC)
+        img3 = img1 & img2
+        img4 = img1 | img2
+        iou = img3.sum() / img4.sum() if img4.sum() != 0 else 0
+        miou += iou
+        dsc = 2 * img3.sum() / (img4.sum() + img3.sum()) if (img4.sum() + img3.sum()) != 0 else 0
+        mdsc += dsc
+
+        # 计算准确性，特异性，敏感性
+        tp = (img1 & img2).sum()
+        tn = (~img1 & ~img2).sum()
+        fp = (~img1 & img2).sum()
+        fn = (img1 & ~img2).sum()
+        accuracy += (tp + tn) / (tp + tn + fp + fn)
+        specificity += tn / (tn + fp) if (tn + fp) != 0 else 0
+        sensitivity += tp / (tp + fn) if (tp + fn) != 0 else 0
+
+        # 计算Hausdorff距离
+        y_true, x_true = np.where(img1)
+        y_pred, x_pred = np.where(img2)
+        if y_true.size and y_pred.size:  # 确保图像不全是黑色的
+            hausdorff_dist = max(directed_hausdorff(np.stack([y_true, x_true], axis=1), np.stack([y_pred, x_pred], axis=1))[0],
+                                 directed_hausdorff(np.stack([y_pred, x_pred], axis=1), np.stack([y_true, x_true], axis=1))[0])
+        else:
+            hausdorff_dist = 0
+        hausdorff_distance += hausdorff_dist
+
+        # 计算平均对称表面距离(ASSD)
+        if y_true.size and y_pred.size:  # 确保图像不全是黑色的
+            true_points = np.stack([y_true, x_true], axis=1)
+            pred_points = np.stack([y_pred, x_pred], axis=1)
+            dist_matrix = scipy.spatial.distance.cdist(true_points, pred_points, 'euclidean')   
+            assd += np.mean(np.min(dist_matrix, axis=0)) + np.mean(np.min(dist_matrix, axis=1))     
+        else:
+            assd += 0
+
+    return miou / total_imgs, mdsc / total_imgs, accuracy / total_imgs, specificity / total_imgs, sensitivity / total_imgs, hausdorff_distance / total_imgs, assd / (2 * total_imgs)
+
+if __name__ == "__main__":
+    #num_classes = 31
+    num_classes = 1
+    backbone = 'resnet50'
+    #input_shape = (448, 448)
+    input_shape = (256, 256)
+    # 原图、高频图、低频图的路径
+    image_dir = "/media/data/liumengyu/CODE/UARB_formula/isic2017_test"
+    # image_dir = "/20TB/lizewei/allimg/"
+    # high_freq_dir = "/20TB/lizewei/allimg_H_alpha=0.03/"
+    # low_freq_dir = "/20TB/lizewei/allimg_L_alpha=0.03/"
+    #save_pdir = "/20TB/lizewei/VMunet_tmi/"
+    save_pdir = "/media/data/liumengyu/CODE/UARB_formula/output"
+    modelsort = "/isic2017_VMunet"  # 模型类别文件夹名称
+    model_path ="/media/data/liumengyu/CODE/Vmunet/output/ModelLabel2026_05_07_20_34/best_epoch_weights.pth"
+    pred_save_path = save_pdir + modelsort + '/pred_image'
+    miou_save = save_pdir + modelsort + '/pred_miou.txt'                                
+    mdsc_save = save_pdir + modelsort + '/pred_mdice.txt'                               
+    macc_save = save_pdir + modelsort + '/pred_macc.txt'
+    mspec_save = save_pdir + modelsort + '/pred_mspec.txt'
+    msen_save = save_pdir + modelsort + '/pred_msen.txt'
+    mhd_save = save_pdir + modelsort + '/pred_mhd.txt'
+    massd_save = save_pdir + modelsort + '/pred_assd.txt'
+
+    transform = transforms.Compose([
+        transforms.ToPILImage(),  # 将图像变成PIL格式    输入为[H, W, C]输出为[H, W, C]       
+        transforms.ToTensor(),  # 将PIL图像转换为tensor    输入为[H, W, C]输出为[C, H, W]    
+    ])
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--root_path', type=str,
+                        default='../data/Synapse/train_npz', help='root dir for data')
+    parser.add_argument('--dataset', type=str,
+                        default='Synapse', help='experiment_name')  # 突触
+    parser.add_argument('--list_dir', type=str,                     
+                        default='./lists/lists_Synapse', help='list dir')
+    parser.add_argument('--num_classes', type=int,
+                        default=31, help='output channel of network')
+    parser.add_argument('--max_iterations', type=int,
+                        default=30000, help='maximum epoch number to train')
+    parser.add_argument('--max_epochs', type=int,
+                        default=150, help='maximum epoch number to train')
+    parser.add_argument('--batch_size', type=int,
+                        default=2, help='batch_size per gpu')
+    parser.add_argument('--n_gpu', type=int, default=1, help='total gpu')
+    parser.add_argument('--deterministic', type=int, default=1,
+                        help='whether use deterministic training')
+    parser.add_argument('--base_lr', type=float, default=0.01,
+                        help='segmentation network learning rate')
+    parser.add_argument('--img_size', type=int,
+                        default=256, help='input patch size of network input')
+    parser.add_argument('--seed', type=int,                                         
+                        default=1234, help='random seed')
+    parser.add_argument('--n_skip', type=int,
+                        default=3, help='using number of skip-connect, default is num')
+    parser.add_argument('--vit_name', type=str,
+                        default='R50-ViT-B_16', help='select one vit model')
+    parser.add_argument('--vit_patches_size', type=int,
+                        default=16, help='vit_patches_size, default is 16')
+    args = parser.parse_args()
+    config_vit = CONFIGS_ViT_seg[args.vit_name]
+    config_vit.n_classes = args.num_classes
+    config_vit.n_skip = args.n_skip
+    
+    config_vit.patches.grid = (
+        int(args.img_size / args.vit_patches_size), int(args.img_size / args.vit_patches_size))
+    config_vit.n_patches = int(args.img_size / args.vit_patches_size) * int(args.img_size / args.vit_patches_size)
+    config_vit.h = int(args.img_size / args.vit_patches_size)
+    config_vit.w = int(args.img_size / args.vit_patches_size)
+
+    unet = VMUNet(
+        num_classes=num_classes,
+        input_channels=3,
+        depths=[2, 2, 2, 2],  # 保持与训练时一致
+        depths_decoder=[2, 2, 2, 1],  # 保持与训练时一致
+        drop_path_rate=0.2,
+        load_ckpt_path=model_path  # 加载训练好的权重
+    )
+    
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # 直接加载完整模型参数
+    checkpoint = torch.load(model_path, map_location=device)
+    if 'model' in checkpoint:  # 如果保存的是包含model键的checkpoint
+        unet.load_state_dict(checkpoint['model'], strict=False)
+    else:  # 如果直接保存的是模型参数
+        unet.load_state_dict(checkpoint, strict=False)
+
+    unet = unet.eval()  # 测试模式
+    unet = nn.DataParallel(unet)
+    unet = unet.cuda()
+
+
+    # unet = ViT_seg(config_vit, img_size=448, num_classes=num_classes)
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # unet.load_state_dict(torch.load(model_path, map_location=device), strict=False)  # 加载模型参数
+    # unet = unet.eval()  # 测试模式
+    # unet = nn.DataParallel(unet)
+    # unet = unet.cuda()
+
+
+    print(model_path)
+    print(
+        '==============================================Predicted Image Save!==============================================')
+    for img in tqdm(os.listdir(image_dir)):
+        imgpath = os.path.join(image_dir, img)
+        # 读取原图、高频图和低频图
+        image = cv2.imread(imgpath, 0)
+        # 调整图像大小
+        image = cv2.resize(image, (256, 256))
+        # 归一化使用
+        image = np.expand_dims(image, -1).repeat(3, axis=-1)  # [448, 448, 3]
+        image = transform(image)  # [3, 448, 448]
+        image = image.unsqueeze(0)  # [b, 3, 448, 448]
+
+
+        # 模型输入修改为三个图像
+        outputs = unet(image.cuda())
+        
+        # 如果模型返回的是元组（例如包含主输出和辅助输出/不确定性图），取第一个作为主预测
+        if isinstance(outputs, tuple):
+            logits1 = outputs[0]
+        else:
+            logits1 = outputs
+
+        # 合并 logits1 和 logits2 的方式可以根据实际需求调整，这里简单求平均
+        pred = torch.sigmoid(logits1)
+        pred = pred.detach().cpu().numpy()
+
+        for i in range(num_classes):
+            save_path = os.path.join(pred_save_path, str(i))
+            if not os.path.exists(save_path):
+                os.makedirs(save_path)
+            savepath = os.path.join(save_path, img)  # 拼接存储路径
+
+            pred_image = pred[0, i, :, :]
+            pred_image = pred_image * 255
+            pred_image[pred_image <= 127] = 0
+            pred_image[pred_image > 127] = 255
+            pred_image = pred_image.astype(np.uint8)
+            cv2.imwrite(savepath, pred_image)
+
+    print(
+        '==================================================Compute Metrics==================================================')  
+    classes = [str(i) for i in range(num_classes)]
+    iou_list = []
+    iou_str_list = []
+    dsc_list = []
+    dsc_str_list = []
+    macc_list = []
+    macc_str_list = []
+    msen_list = []
+    msen_str_list = []
+    mspec_list = []
+    mspec_str_list = []
+    mhd_list = []
+    mhd_str_list = []
+    massd_list = []
+    massd_str_list = []
+    for cls in tqdm(classes):
+        imgpath = os.path.join(pred_save_path, cls)
+
+        # 这里的labelpath可能需要根据您的ISIC17数据集标签路径进行修改
+        labelpath = os.path.join("/media/data/liumengyu/Dataset/MedicalImageDataset/ISIC17/masks", cls) # 修改为实际路径
+
+        miou, mdsc, macc, mspec, msen = calall(imgpath, labelpath)
+        # miou, mdsc  = calmiou(imgpath, labelpath)
+        iou_list.append(miou)
+        miou_str = '第{}标签的miou: {}'.format(str(int(cls) + 1), miou)
+        iou_str_list.append(miou_str)
+
+        dsc_list.append(mdsc)
+        mdsc_str = '第{}标签的mdsc: {}'.format(str(int(cls) + 1), mdsc)
+        dsc_str_list.append(mdsc_str)
+        
+        macc_list.append(macc)
+        macc_str = '第{}标签的macc: {}'.format(str(int(cls) + 1), macc)
+        macc_str_list.append(macc_str)
+        
+        mspec_list.append(mspec)
+        mspec_str = '第{}标签的mspec: {}'.format(str(int(cls) + 1), mspec)
+        mspec_str_list.append(mspec_str)
+        
+        msen_list.append(msen)
+        msen_str = '第{}标签的msen: {}'.format(str(int(cls) + 1), msen)
+        msen_str_list.append(msen_str)
+
+    # 计算总体平均值
+    mmiou_str = sum(iou_list) / len(iou_list) if len(iou_list) > 0 else 0
+    mmdsc_str = sum(dsc_list) / len(dsc_list) if len(dsc_list) > 0 else 0
+    mmacc_str = sum(macc_list) / len(macc_list) if len(macc_list) > 0 else 0
+    mmspec_str = sum(mspec_list) / len(mspec_list) if len(mspec_list) > 0 else 0
+    mmsen_str = sum(msen_list) / len(msen_list) if len(msen_list) > 0 else 0
+
+    # 构建结果字符串
+    miou_str_out = '\n'.join(iou_str_list) + f'\n平均miou指标：{mmiou_str}\n'
+    mdsc_str_out = '\n'.join(dsc_str_list) + f'\n平均mdsc指标：{mmdsc_str}\n'
+    macc_str_out = '\n'.join(macc_str_list) + f'\n平均macc指标：{mmacc_str}\n'
+    mspec_str_out = '\n'.join(mspec_str_list) + f'\n平均mspec指标：{mmspec_str}\n'
+    msen_str_out = '\n'.join(msen_str_list) + f'\n平均msen指标：{mmsen_str}\n'
+
+    # 打印平均指标
+    print('miou平均指标：', mmiou_str)
+    with open(miou_save, 'w') as f:
+        f.write(miou_str_out)
+
+    print('mdsc平均指标：', mmdsc_str)
+    with open(mdsc_save, 'w') as d:
+        d.write(mdsc_str_out)
+        
+    print('macc平均指标：', mmacc_str)
+    with open(macc_save, 'w') as f:
+        f.write(macc_str_out)
+
+    print('mspec平均指标：', mmspec_str)
+    with open(mspec_save, 'w') as f:
+        f.write(mspec_str_out)
+        
+    print('msen平均指标：', mmsen_str)
+    with open(msen_save, 'w') as f:
+        f.write(msen_str_out)
+    # End of metrics computation
+
